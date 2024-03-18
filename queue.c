@@ -3,15 +3,21 @@
 #include <threads.h>
 #include <stdatomic.h>
 
+// Node structure for the queue
 typedef struct Node {
     void* data;
     struct Node* next;
 } Node;
 
+// Volatile pointers to head and tail of the queue
 static Node* volatile head = NULL;
 static Node* volatile tail = NULL;
+
+// Mutex and condition variable for thread synchronization
 static mtx_t queue_lock;
 static cnd_t queue_not_empty;
+
+// Atomic counters for queue size, waiting threads, and visited items
 static atomic_size_t queue_size = 0;
 static atomic_size_t queue_waiting = 0;
 static atomic_size_t queue_visited = 0;
@@ -28,22 +34,28 @@ void initQueue(void) {
 
 // Destroy the queue
 void destroyQueue(void) {
-    Node* temp;
     while (head != NULL) {
-        temp = head;
-        head = head->next;
-        free(temp);
+        dequeue(); // Dequeue all items to free memory
     }
-    tail = NULL;
     mtx_destroy(&queue_lock);
     cnd_destroy(&queue_not_empty);
 }
 
+// Create a new node
+Node* createNode(void* data) {
+    Node* new_node = malloc(sizeof(Node));
+    if (new_node == NULL) {
+        // Handle memory allocation failure here
+        exit(EXIT_FAILURE);
+    }
+    new_node->data = data;
+    new_node->next = NULL;
+    return new_node;
+}
+
 // Enqueue an item
 void enqueue(void* item) {
-    Node* new_node = malloc(sizeof(Node));
-    new_node->data = item;
-    new_node->next = NULL;
+    Node* new_node = createNode(item);
 
     mtx_lock(&queue_lock);
     if (tail == NULL) {
@@ -53,7 +65,7 @@ void enqueue(void* item) {
         tail = new_node;
     }
     atomic_fetch_add(&queue_size, 1);
-    cnd_broadcast(&queue_not_empty); // Use broadcast to wake all waiting threads
+    cnd_broadcast(&queue_not_empty); // Wake all waiting threads
     mtx_unlock(&queue_lock);
 }
 
