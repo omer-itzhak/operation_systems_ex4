@@ -4,324 +4,323 @@
 #include <stdlib.h>
 
 
-// Manages a collection of thread entries, tracking the first and last entries and the count of entries awaiting processing.
-struct QueueOfThreads
+// Oversees the management of a thread queue, keeping tabs on the head and tail, as well as the tally of threads lined up for processing.
+struct ThreadQueue
 {
-    struct ThreadNode *first;
-    struct ThreadNode *last;
-    atomic_ulong count_of_waiting_threads;
+    struct QueueNode *head;
+    struct QueueNode *tail;
+    atomic_ulong waiting_thread_count;
 };
 
-// Represents a single thread entry in the queue, including its unique ID, next node, condition variable, termination status, and wait condition.
-struct ThreadNode
+// Describes an individual thread node within the queue, detailing its unique ID, successor, synchronization condition variable, completion state, and condition to wait for.
+struct QueueNode
 {
-    thrd_t thread_id;
-    struct ThreadNode *next_node;
-    // Unique condition variable for each thread to enable specific signaling.
-    cnd_t condition_var;
-    bool is_terminated;
-    int waiting_for;
+    thrd_t id;
+    struct QueueNode *successor;
+    // Dedicated condition variable for selective thread notification.
+    cnd_t sync_condition;
+    bool terminated;
+    int wait_condition;
 };
 
-// Queue structure for data elements, including pointers to the first and last elements, and counters for size, processed, and added elements.
-struct QueueOfData
+// Organizes a queue for generic data items, containing pointers to the first and last entries, and maintains metrics for total size, number of processed items, and quantity of items entered.
+struct DataQueue
 {
-    struct DataNode *first;
-    struct DataNode *last;
-    atomic_ulong size;
-    atomic_ulong processed_count;
-    atomic_ulong added_count;
-    mtx_t lock;
+    struct DataElement *head;
+    struct DataElement *tail;
+    atomic_ulong total_size;
+    atomic_ulong items_processed;
+    atomic_ulong items_enqueued;
+    mtx_t synchronization_lock;
 };
 
-// Represents a single data element within the data queue, including a pointer to the next element, an index, and the data pointer itself.
-struct DataNode
+// Characterizes an individual node within the data queue, holding a reference to the subsequent node, an identifier for the data, and the pointer to the data itself.
+struct DataElement
 {
-    struct DataNode *next_node;
-    int data_index;
-    void *data_ptr;
+    struct DataElement *next;
+    int index;
+    void *pointer;
 };
 
 
 
-static struct QueueOfThreads thread_queue;
-static struct QueueOfData data_queue;
-static thrd_t terminator;
+static struct ThreadQueue thread_queue;
+static struct DataQueue data_queue;
+static thrd_t current_thread;
 
 
-void clear_all_data_nodes(void);
-void dismantle_queue_of_threads(void);
-struct DataNode *initialize_data_node(void *data);
-void insert_node_into_data_queue(struct DataNode *node_to_add);
-void insert_node_into_empty_data_queue(struct DataNode *node_to_add);
-void insert_node_into_nonempty_data_queue(struct DataNode *node_to_add);
-bool should_current_thread_yield(void);
-void enqueue_thread_node(void);
-void dequeue_thread_node(void);
-void insert_node_into_thread_queue(struct ThreadNode *node_to_add);
-void insert_node_into_empty_thread_queue(struct ThreadNode *node_to_add);
-void insert_node_into_nonempty_thread_queue(struct ThreadNode *node_to_add);
-struct ThreadNode *initialize_thread_node(void);
-int retrieve_first_waiting_status(void);
+void removeAllDataElements(void);
+void teardownThreadQueue(void);
+struct DataElement *createDataElement(void *data);
+void appendToDataQueue(struct DataElement *elementToAdd);
+void appendToEmptyDataQueue(struct DataElement *elementToAdd);
+void appendToPopulatedDataQueue(struct DataElement *elementToAdd);
+bool checkIfThreadShouldYield(void);
+void enqueueQueueNode(void);
+void dequeueQueueNode(void);
+void appendToThreadQueue(struct QueueNode *nodeToAdd);
+void appendToEmptyThreadQueue(struct QueueNode *nodeToAdd);
+void appendToPopulatedThreadQueue(struct QueueNode *nodeToAdd);
+struct QueueNode *createThreadQueueNode(void);
+int fetchFirstWaitConditionStatus(void);
 
 
 void initQueue(void)
 {
-    // Initialize data queue pointers to null, indicating an empty queue.
-    data_queue.first = NULL;
-    data_queue.last = NULL;
-    // Reset all data queue counters to 0, reflecting an empty state.
-    data_queue.size = 0;
-    data_queue.processed_count = 0;
-    data_queue.added_count = 0;
-    // Initialize the mutex lock for data queue operations.
-    mtx_init(&data_queue.lock, mtx_plain);
+    // Set pointers in the data queue to NULL, preparing for an empty queue state.
+    dataQueue.head = NULL;
+    dataQueue.tail = NULL;
+    // Initialize all counters in the data queue to 0 for a clear start.
+    dataQueue.total_size = 0;
+    dataQueue.items_processed = 0;
+    dataQueue.items_enqueued = 0;
+    // Prepare the mutex for future operations on the data queue.
+    mtx_init(&dataQueue.synchronization_lock, mtx_plain);
     
-    // Initialize thread queue pointers to null, showing no threads are queued.
-    thread_queue.first = NULL;
-    thread_queue.last = NULL;
-    // Reset the count of waiting threads to 0.
-    thread_queue.count_of_waiting_threads = 0;
+    // Set thread queue pointers to NULL, indicating absence of enqueued threads.
+    threadQueue.head = NULL;
+    threadQueue.tail = NULL;
+    // Initialize the count of threads in waiting to 0.
+    threadQueue.waiting_thread_count = 0;
 }
 
 void destroyQueue(void)
 {
-    // Acquire the lock on the data queue to ensure exclusive access.
-    mtx_lock(&data_queue.lock);
-    // Clear all nodes from the data queue safely.
-    clear_all_data_nodes();
-    // Dismantle the thread queue, ensuring all thread nodes are properly managed.
-    dismantle_queue_of_threads();
-    // Release the lock after operations are completed.
-    mtx_unlock(&data_queue.lock);
-    // Destroy the mutex lock, as the data queue will no longer be in use.
-    mtx_destroy(&data_queue.lock);
+    // Obtain exclusive access to the data queue by locking it.
+    mtx_lock(&dataQueue.synchronization_lock);
+    // Perform a secure cleanup of data nodes.
+    removeAllDataElements();
+    // Methodically dismantle the thread queue.
+    teardownThreadQueue();
+    // Unlock the data queue after finishing cleanup activities.
+    mtx_unlock(&dataQueue.synchronization_lock);
+    // Dispose of the mutex as the data queue is no longer required.
+    mtx_destroy(&dataQueue.synchronization_lock);
 }
 
-void clear_all_data_nodes(void)
+void removeAllDataElements(void)
 {
-    struct DataNode *previous_node;
-    while (data_queue.first != NULL)
+    struct DataElement *current_element;
+    while (dataQueue.head != NULL)
     {
-        previous_node = data_queue.first;
-        data_queue.first = previous_node->next_node;
-        free(previous_node);
+        current_element = dataQueue.head;
+        dataQueue.head = current_element->next;
+        free(current_element);
     }
-    // Although resetting these fields might not be strictly necessary, it ensures the data queue is in a clean state.
-    data_queue.last = NULL;
-    data_queue.size = 0;
-    data_queue.processed_count = 0;
-    data_queue.added_count = 0;
+    // Clear remaining fields to maintain a consistent state for the data queue.
+    dataQueue.tail = NULL;
+    dataQueue.total_size = 0;
+    dataQueue.items_processed = 0;
+    dataQueue.items_enqueued = 0;
 }
 
-void dismantle_queue_of_threads(void)
+void teardownThreadQueue(void)
 {
-    terminator = thrd_current();
-    while (thread_queue.first != NULL)
+    thrd_t current_thread = thrd_current();
+    while (threadQueue.head != NULL)
     {
-        thread_queue.first->is_terminated = true;
-        cnd_signal(&thread_queue.first->condition_var);
-        // Move to the next node to avoid an infinite loop.
-        thread_queue.first = thread_queue.first->next_node;
+        threadQueue.head->terminated = true;
+        cnd_signal(&threadQueue.head->sync_condition);
+        // Advance to the next node to prevent looping indefinitely.
+        threadQueue.head = threadQueue.head->successor;
     }
-    // Reset the thread queue to a clean state after clearing it.
-    thread_queue.last = NULL;
-    thread_queue.count_of_waiting_threads = 0;
+    // Restore the thread queue to an initial state after emptying it.
+    threadQueue.tail = NULL;
+    threadQueue.waiting_thread_count = 0;
 }
 
-void enqueue(void *element_data)
+void enqueue(void *data)
 {
-    mtx_lock(&data_queue.lock);
-    struct DataNode *new_node = initialize_data_node(element_data);
-    insert_node_into_data_queue(new_node);
-    mtx_unlock(&data_queue.lock);
+    mtx_lock(&dataQueue.synchronization_lock);
+    struct DataElement *new_element = createDataElement(data);
+    appendToDataQueue(new_element);
+    mtx_unlock(&dataQueue.synchronization_lock);
 
-    if (data_queue.size > 0 && thread_queue.count_of_waiting_threads > 0)
+    if (dataQueue.total_size > 0 && threadQueue.waiting_thread_count > 0)
     {
-        // Signaling the first thread in the queue if there are elements in the data queue and waiting threads.
-        cnd_signal(&thread_queue.first->condition_var);
+        // Trigger the first thread in the queue if there are items and threads are waiting.
+        cnd_signal(&threadQueue.head->sync_condition);
     }
 }
 
-struct DataNode *initialize_data_node(void *data)
+struct DataElement *createDataElement(void *data)
 {
-    // Assuming malloc succeeds as per instructions.
-    struct DataNode *node = (struct DataNode *)malloc(sizeof(struct DataNode));
-    node->data_ptr = data;
-    node->next_node = NULL;
-    node->data_index = data_queue.added_count;
-    return node;
+    // Assume successful memory allocation as per the given context.
+    struct DataElement *element = (struct DataElement *)malloc(sizeof(struct DataElement));
+    element->pointer = data;
+    element->next = NULL;
+    element->index = dataQueue.items_enqueued;
+    return element;
 }
 
-void insert_node_into_data_queue(struct DataNode *node_to_add)
+void addToDataQueue(struct DataElement *elementToAdd)
 {
-    data_queue.size == 0 ? insert_node_into_empty_data_queue(node_to_add) : insert_node_into_nonempty_data_queue(node_to_add);
+    dataQueue.total_size == 0 ? appendToEmptyDataQueue(elementToAdd) : appendToPopulatedDataQueue(elementToAdd);
 }
 
-void insert_node_into_empty_data_queue(struct DataNode *node_to_add)
+void appendToEmptyDataQueue(struct DataElement *elementToAdd)
 {
-    data_queue.first = node_to_add;
-    data_queue.last = node_to_add;
-    data_queue.size++;
-    data_queue.added_count++;
+    dataQueue.head = elementToAdd;
+    dataQueue.tail = elementToAdd;
+    dataQueue.total_size++;
+    dataQueue.items_enqueued++;
 }
 
-void insert_node_into_nonempty_data_queue(struct DataNode *node_to_add)
+void appendToPopulatedDataQueue(struct DataElement *elementToAdd)
 {
-    data_queue.last->next_node = node_to_add;
-    data_queue.last = node_to_add;
-    data_queue.size++;
-    data_queue.added_count++;
+    dataQueue.tail->next = elementToAdd;
+    dataQueue.tail = elementToAdd;
+    dataQueue.total_size++;
+    dataQueue.items_enqueued++;
 }
 
 void *dequeue(void)
 {
-    mtx_lock(&data_queue.lock);
-    // This loop blocks as required
-    while (should_current_thread_yield())
+    mtx_lock(&dataQueue.synchronization_lock);
+    // Thread waits if necessary as per the conditions
+    while (checkIfThreadShouldYield())
     {
-        enqueue_thread_node();
-        struct ThreadNode *current = thread_queue.last;
-        cnd_wait(&current->condition_var, &data_queue.lock);
-        if (current->is_terminated)
+        enqueueQueueNode();
+        struct QueueNode *currentThreadNode = threadQueue.tail;
+        cnd_wait(&currentThreadNode->sync_condition, &dataQueue.synchronization_lock);
+        if (currentThreadNode->terminated)
         {
-            struct ThreadNode *previous_first;
-            previous_first = thread_queue.first;
-            thread_queue.first = previous_first->next_node;
-            // Prevents runaway threads upon destruction
-            free(previous_first);
-            thrd_join(terminator, NULL);
+            struct QueueNode *previousHead;
+            previousHead = threadQueue.head;
+            threadQueue.head = previousHead->successor;
+            // To prevent orphan threads when the queue is being destroyed
+            free(previousHead);
+            thrd_join(current_thread, NULL);
         }
-        if (data_queue.first && retrieve_first_waiting_status() <= data_queue.first->data_index)
+        if (dataQueue.head && fetchFirstWaitConditionStatus() <= dataQueue.head->index)
         {
-            dequeue_thread_node();
+            dequeueQueueNode();
         }
     }
 
-    struct DataNode *dequeued_node = data_queue.first;
-    data_queue.first = dequeued_node->next_node;
-    if (data_queue.first == NULL)
+    struct DataElement *elementRemoved = dataQueue.head;
+    dataQueue.head = elementRemoved->next;
+    if (dataQueue.head == NULL)
     {
-        data_queue.last = NULL;
+        dataQueue.tail = NULL;
     }
-    data_queue.size--;
-    data_queue.processed_count++;
-    mtx_unlock(&data_queue.lock);
-    void *data = dequeued_node->data_ptr;
-    free(dequeued_node);
+    dataQueue.total_size--;
+    dataQueue.items_processed++;
+    mtx_unlock(&dataQueue.synchronization_lock);
+    void *data = elementRemoved->pointer;
+    free(elementRemoved);
     return data;
 }
 
-
-bool should_current_thread_yield(void)
+bool checkIfThreadShouldYield(void)
 {
-    if (data_queue.size == 0)
+    if (dataQueue.total_size == 0)
     {
         return true;
     }
-    if (thread_queue.count_of_waiting_threads <= data_queue.size)
+    if (threadQueue.waiting_thread_count <= dataQueue.total_size)
     {
         return false;
     }
-    int first_waiting_on = retrieve_first_waiting_status();
-    return first_waiting_on > data_queue.first->data_index;
+    int statusOfFirstWaiting = fetchFirstWaitConditionStatus();
+    return statusOfFirstWaiting > dataQueue.head->index;
 }
 
-int retrieve_first_waiting_status(void)
+int fetchFirstWaitConditionStatus(void)
 {
-    struct ThreadNode *thread_node = thread_queue.first;
-    while (thread_node != NULL)
+    struct QueueNode *threadNodeChecker = threadQueue.head;
+    while (threadNodeChecker != NULL)
     {
-        if (thrd_equal(thrd_current(), thread_node->thread_id))
+        if (thrd_equal(thrd_current(), threadNodeChecker->thread_id))
         {
-            return thread_node->waiting_for;
+            return threadNodeChecker->waiting_on_index;
         }
-        thread_node = thread_node->next_node;
+        threadNodeChecker = threadNodeChecker->successor;
     }
     return -1;
 }
 
-void enqueue_thread_node(void)
+void enqueueQueueNode(void)
 {
-    struct ThreadNode *new_thread_node = initialize_thread_node();
-    insert_node_into_thread_queue(new_thread_node);
+    struct QueueNode *newQueueNode = createThreadQueueNode();
+    appendToThreadQueue(newQueueNode);
 }
 
-void dequeue_thread_node(void)
+void dequeueQueueNode(void)
 {
-    struct ThreadNode *dequeued_thread = thread_queue.first;
-    thread_queue.first = dequeued_thread->next_node;
-    free(dequeued_thread);
-    if (thread_queue.first == NULL)
+    struct QueueNode *nodeBeingRemoved = threadQueue.head;
+    threadQueue.head = nodeBeingRemoved->successor;
+    free(nodeBeingRemoved);
+    if (threadQueue.head == NULL)
     {
-        thread_queue.last = NULL;
+        threadQueue.tail = NULL;
     }
-    thread_queue.count_of_waiting_threads--;
+    threadQueue.waiting_thread_count--;
 }
 
-void insert_node_into_thread_queue(struct ThreadNode *node_to_add)
+void appendToThreadQueue(struct QueueNode *nodeToAdd)
 {
-    thread_queue.count_of_waiting_threads == 0 ? insert_node_into_empty_thread_queue(node_to_add) : insert_node_into_nonempty_thread_queue(node_to_add);
+    threadQueue.waiting_thread_count == 0 ? appendToEmptyThreadQueue(nodeToAdd) : appendToPopulatedThreadQueue(nodeToAdd);
 }
 
-void insert_node_into_empty_thread_queue(struct ThreadNode *node_to_add)
+void appendToEmptyThreadQueue(struct QueueNode *nodeToAdd)
 {
-    thread_queue.first = node_to_add;
-    thread_queue.last = node_to_add;
-    thread_queue.count_of_waiting_threads++;
+    threadQueue.head = nodeToAdd;
+    threadQueue.tail = nodeToAdd;
+    threadQueue.waiting_thread_count++;
 }
 
-void insert_node_into_nonempty_thread_queue(struct ThreadNode *node_to_add)
+void appendToPopulatedThreadQueue(struct QueueNode *nodeToAdd)
 {
-    thread_queue.last->next_node = node_to_add;
-    thread_queue.last = node_to_add;
-    thread_queue.count_of_waiting_threads++;
+    threadQueue.tail->successor = nodeToAdd;
+    threadQueue.tail = nodeToAdd;
+    threadQueue.waiting_thread_count++;
 }
 
-struct ThreadNode *initialize_thread_node(void)
+struct QueueNode *createThreadQueueNode(void)
 {
-    struct ThreadNode *thread_node = (struct ThreadNode *)malloc(sizeof(struct ThreadNode));
-    thread_node->thread_id = thrd_current();
-    thread_node->next_node = NULL;
-    thread_node->is_terminated = false;
-    cnd_init(&thread_node->condition_var);
-    thread_node->waiting_for = data_queue.added_count + thread_queue.count_of_waiting_threads;
-    return thread_node;
+    struct QueueNode *newQueueNode = (struct QueueNode *)malloc(sizeof(struct QueueNode));
+    newQueueNode->thread_id = thrd_current();
+    newQueueNode->successor = NULL;
+    newQueueNode->terminated = false;
+    cnd_init(&newQueueNode->sync_condition);
+    newQueueNode->waiting_on_index = dataQueue.items_enqueued + threadQueue.waiting_thread_count;
+    return newQueueNode;
 }
 
-bool tryDequeue(void **element)
+bool tryDequeue(void **dataPointer)
 {
-    mtx_lock(&data_queue.lock);
-    while (data_queue.size == 0 || data_queue.first == NULL)
+    mtx_lock(&dataQueue.synchronization_lock);
+    if (dataQueue.total_size == 0 || dataQueue.head == NULL)
     {
-        mtx_unlock(&data_queue.lock);
+        mtx_unlock(&dataQueue.synchronization_lock);
         return false;
     }
-    struct DataNode *dequeued_node = data_queue.first;
-    data_queue.first = dequeued_node->next_node;
-    if (data_queue.first == NULL)
+    struct DataElement *elementBeingRemoved = dataQueue.head;
+    dataQueue.head = elementBeingRemoved->next;
+    if (dataQueue.head == NULL)
     {
-        data_queue.last = NULL;
+        dataQueue.tail = NULL;
     }
-    data_queue.size--;
-    data_queue.processed_count++;
-    mtx_unlock(&data_queue.lock);
-    *element = dequeued_node->data_ptr;
-    free(dequeued_node);
+    dataQueue.total_size--;
+    dataQueue.items_processed++;
+    mtx_unlock(&dataQueue.synchronization_lock);
+    *dataPointer = elementBeingRemoved->pointer;
+    free(elementBeingRemoved);
     return true;
 }
 
 size_t size(void)
 {
-    return data_queue.size;
+    return dataQueue.total_size;
 }
 
 size_t waiting(void)
 {
-    return thread_queue.count_of_waiting_threads;
+    return threadQueue.waiting_thread_count;
 }
 
 size_t visited(void)
 {
-    return data_queue.processed_count;
+    return dataQueue.items_processed;
 }
